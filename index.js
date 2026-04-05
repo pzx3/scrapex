@@ -1,208 +1,152 @@
 /**
- * ╔══════════════════════════════════════════════════════╗
- * ║   ⚡ ScrapEx — Professional Web Scraping Library     ║
- * ║   Fast • Smart • Lightweight • Zero dependencies     ║
- * ╚══════════════════════════════════════════════════════╝
- *
- *  Architecture:
- *  ┌─────────────────────────────────────────────────────┐
- *  │  ScrapEx (Fluent API)                               │
- *  │    ├── HttpEngine (fetch + cache + limiter + retry) │
- *  │    ├── FastTokenizer (custom state-machine parser)  │
- *  │    ├── QueryEngine  (CSS selector engine)           │
- *  │    ├── SmartExtractors (tables/links/schema/media)  │
- *  │    └── Pipeline (chainable transforms)              │
- *  └─────────────────────────────────────────────────────┘
+ * ⚡ ScrapEx - Pipeline
+ * Fluent chainable data transformation system
  */
 
-import { HttpEngine }                                   from './core/engine.js';
-import { buildTree, FastTokenizer, QueryEngine }         from './core/parser.js';
-import {
-  extractLinks, extractTables, extractMedia,
-  extractSchema, extractMainContent,
-  extractContacts, detectPagination, clean,
-}                                                        from './extractors/index.js';
-import { Pipeline, pipeline }                            from './pipeline/index.js';
-
-// ── ScrapEx Result ──────────────────────────────────────────
-class ScrapExResult {
-  constructor(response, tree, url) {
-    this._res  = response;
-    this._tree = tree;
-    this._url  = url;
-    this._cache = {};
+// ── Transform Pipeline ──────────────────────────────────────
+export class Pipeline {
+  constructor(data) {
+    this._data  = Array.isArray(data) ? data : [data];
+    this._steps = [];
+    this._errors = [];
   }
 
-  get url()         { return this._res.url || this._url; }
-  get status()      { return this._res.status; }
-  get html()        { return this._res.body; }
-  get headers()     { return this._res.headers; }
-  get fromCache()   { return this._res.fromCache || false; }
-  get ms()          { return this._res.ms || 0; }
+  // Add a transform step
+  pipe(fn)    { this._steps.push({ type: 'map',    fn }); return this; }
+  filter(fn)  { this._steps.push({ type: 'filter', fn }); return this; }
+  tap(fn)     { this._steps.push({ type: 'tap',    fn }); return this; }
+  limit(n)    { this._steps.push({ type: 'limit',  n  }); return this; }
+  skip(n)     { this._steps.push({ type: 'skip',   n  }); return this; }
+  unique(key) { this._steps.push({ type: 'unique', key }); return this; }
+  flatten()   { this._steps.push({ type: 'flatten' });     return this; }
 
-  // ── Direct Query ─────────────────────────────────────────
-  $(sel)            { return this._tree.$(sel); }
-  $$(sel)           { return this._tree.$$(sel); }
+  // Built-in cleaners
+  trimText(key) {
+    return this.pipe(item => {
+      if (typeof item === 'string') return item.trim();
+      if (key && item?.[key]) return { ...item, [key]: item[key].trim() };
+      if (!key && typeof item === 'object') {
+        const out = {};
+        for (const [k, v] of Object.entries(item))
+          out[k] = typeof v === 'string' ? v.trim() : v;
+        return out;
+      }
+      return item;
+    });
+  }
 
-  text(sel)  { const n = this.$(sel); return n ? clean.text(n.text) : null; }
-  texts(sel) { return this.$$(sel).map(n => clean.text(n.text)); }
-  attr(sel, attr)  { return this.$(sel)?.attr(attr) ?? null; }
-  attrs(sel, attr) { return this.$$(sel).map(n => n.attr(attr)).filter(Boolean); }
-  href(sel)        { return clean.url(this.attr(sel, 'href'), this.url); }
-  hrefs(sel)       { return this.$$(sel).map(n => clean.url(n.attr('href'), this.url)).filter(Boolean); }
-  src(sel)         { return clean.url(this.attr(sel, 'src'), this.url); }
-  num(sel)         { return clean.num(this.text(sel)); }
+  removeEmpty(keys) {
+    return this.filter(item => {
+      if (!item) return false;
+      if (typeof item === 'string') return item.trim().length > 0;
+      const targets = keys || Object.keys(item);
+      return targets.some(k => item[k] !== null && item[k] !== undefined && item[k] !== '');
+    });
+  }
 
-  // ── Smart Extract ─────────────────────────────────────────
-  get links()   { return this._cached('links',   () => extractLinks(this._tree, this.url)); }
-  get tables()  { return this._cached('tables',  () => extractTables(this._tree)); }
-  get media()   { return this._cached('media',   () => extractMedia(this._tree, this.url)); }
-  get schema()  { return this._cached('schema',  () => extractSchema(this._tree)); }
-  get content() { return this._cached('content', () => extractMainContent(this._tree)); }
-  get contacts(){ return this._cached('contacts',() => extractContacts(this.html)); }
-  get pages()   { return this._cached('pages',   () => detectPagination(this._tree, this.url)); }
+  rename(map) {
+    return this.pipe(item => {
+      if (typeof item !== 'object' || !item) return item;
+      const out = { ...item };
+      for (const [from, to] of Object.entries(map)) {
+        if (from in out) { out[to] = out[from]; delete out[from]; }
+      }
+      return out;
+    });
+  }
 
-  // ── Structured Scraping via Schema ─────────────────────────
-  extract(schema) {
-    const result = {};
-    for (const [key, def] of Object.entries(schema)) {
-      if (typeof def === 'string') {
-        result[key] = this.text(def);
-      } else if (typeof def === 'function') {
-        result[key] = def(this._tree, this);
-      } else if (def.sel) {
-        const { sel, attr: attrName, type = 'text', all = false, transform } = def;
-        let val;
-        if (all) {
-          val = attrName ? this.attrs(sel, attrName) : this.texts(sel);
-        } else {
-          val = attrName ? this.attr(sel, attrName) : this.text(sel);
+  pick(keys) {
+    return this.pipe(item => {
+      if (typeof item !== 'object') return item;
+      return Object.fromEntries(keys.map(k => [k, item[k]]));
+    });
+  }
+
+  cast(schema) {
+    return this.pipe(item => {
+      const out = { ...item };
+      for (const [key, type] of Object.entries(schema)) {
+        if (!(key in out)) continue;
+        switch (type) {
+          case 'number': out[key] = parseFloat(out[key]) || null; break;
+          case 'int'   : out[key] = parseInt(out[key]) || null;   break;
+          case 'bool'  : out[key] = Boolean(out[key]);            break;
+          case 'date'  : out[key] = new Date(out[key]);           break;
+          case 'string': out[key] = String(out[key] ?? '');       break;
+          case 'array' : out[key] = Array.isArray(out[key]) ? out[key] : [out[key]]; break;
         }
-        if (type === 'number') val = clean.num(val);
-        if (type === 'url')    val = clean.url(val, this.url);
-        if (transform)         val = transform(val);
-        result[key] = val;
+      }
+      return out;
+    });
+  }
+
+  validate(schema) {
+    return this.pipe(item => {
+      for (const [key, rules] of Object.entries(schema)) {
+        const val = item?.[key];
+        if (rules.required && (val === null || val === undefined || val === '')) {
+          const err = new Error(`Validation failed: '${key}' is required`);
+          err.item = item;
+          this._errors.push(err);
+          return null;
+        }
+        if (rules.min !== undefined && val < rules.min) {
+          this._errors.push(new Error(`'${key}' < min(${rules.min})`));
+          return null;
+        }
+        if (rules.max !== undefined && val > rules.max) {
+          this._errors.push(new Error(`'${key}' > max(${rules.max})`));
+          return null;
+        }
+        if (rules.pattern && !rules.pattern.test(val)) {
+          this._errors.push(new Error(`'${key}' failed pattern`));
+          return null;
+        }
+      }
+      return item;
+    }).filter(Boolean);
+  }
+
+  // Execute pipeline
+  run() {
+    let data = [...this._data];
+
+    for (const step of this._steps) {
+      switch (step.type) {
+        case 'map'    : data = data.map(step.fn); break;
+        case 'filter' : data = data.filter(step.fn); break;
+        case 'tap'    : data.forEach(step.fn); break;
+        case 'limit'  : data = data.slice(0, step.n); break;
+        case 'skip'   : data = data.slice(step.n); break;
+        case 'flatten': data = data.flat(Infinity); break;
+        case 'unique' : {
+          const seen = new Set();
+          data = data.filter(item => {
+            const key = step.key ? item?.[step.key] : JSON.stringify(item);
+            if (seen.has(key)) return false;
+            seen.add(key); return true;
+          });
+          break;
+        }
       }
     }
-    return result;
+    return data;
   }
 
-  // ── Pipeline shortcut ─────────────────────────────────────
-  pipe(data) { return new Pipeline(Array.isArray(data) ? data : [data]); }
-
-  _cached(key, fn) {
-    if (!(key in this._cache)) this._cache[key] = fn();
-    return this._cache[key];
+  toJSON()   { return JSON.stringify(this.run(), null, 2); }
+  toCSV(sep = ',') {
+    const rows = this.run();
+    if (!rows.length) return '';
+    const headers = Object.keys(rows[0]);
+    const escape  = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    return [
+      headers.map(escape).join(sep),
+      ...rows.map(r => headers.map(h => escape(r[h])).join(sep)),
+    ].join('\n');
   }
 
-  toJSON() {
-    return {
-      url: this.url, status: this.status,
-      fromCache: this.fromCache, ms: this.ms,
-    };
-  }
+  get errors() { return this._errors; }
+  get length()  { return this.run().length; }
 }
 
-// ── Main ScrapEx Class ──────────────────────────────────────
-export class ScrapEx {
-  constructor(opts = {}) {
-    this.engine  = new HttpEngine(opts);
-    this._opts   = opts;
-  }
-
-  // ── Core Fetch + Parse ────────────────────────────────────
-  async fetch(url, opts = {}) {
-    const res  = await this.engine.fetch(url, opts);
-    const html = typeof res.body === 'string' ? res.body : '';
-    const tree = buildTree(html);
-    return new ScrapExResult(res, tree, url);
-  }
-
-  // Shorthand
-  async get(url, opts)  { return this.fetch(url, { ...opts, method: 'GET'  }); }
-  async post(url, opts) { return this.fetch(url, { ...opts, method: 'POST' }); }
-
-  // ── Batch Scrape ──────────────────────────────────────────
-  async scrapeAll(urls, { schema, concurrency = 5, ...opts } = {}) {
-    const results = [];
-    const errors  = [];
-
-    for (let i = 0; i < urls.length; i += concurrency) {
-      const batch = urls.slice(i, i + concurrency);
-      const settled = await Promise.allSettled(batch.map(url => this.fetch(url, opts)));
-
-      settled.forEach((s, idx) => {
-        if (s.status === 'fulfilled') {
-          const page = s.value;
-          results.push(schema ? { url: page.url, ...page.extract(schema) } : page);
-        } else {
-          errors.push({ url: batch[idx], error: s.reason.message });
-        }
-      });
-    }
-    return { results, errors };
-  }
-
-  // ── Auto Crawler ──────────────────────────────────────────
-  async * crawl(startUrl, { maxPages = 50, filter, delay = 500, schema, ...opts } = {}) {
-    const visited = new Set();
-    const queue   = [startUrl];
-
-    while (queue.length && visited.size < maxPages) {
-      const url = queue.shift();
-      if (visited.has(url)) continue;
-      visited.add(url);
-
-      let page;
-      try {
-        page = await this.fetch(url, opts);
-      } catch (e) {
-        yield { url, error: e.message }; continue;
-      }
-
-      const result = schema ? { url: page.url, ...page.extract(schema) } : page;
-      yield result;
-
-      // Discover new links
-      const newLinks = page.links
-        .map(l => l.href)
-        .filter(href => href && !visited.has(href) && href.startsWith(startUrl));
-
-      if (filter) newLinks.filter(filter).forEach(l => queue.push(l));
-      else        newLinks.forEach(l => queue.push(l));
-
-      if (delay && queue.length) await sleep(delay);
-    }
-  }
-
-  // ── Parse raw HTML ────────────────────────────────────────
-  parse(html, fakeUrl = 'https://example.com') {
-    const tree = buildTree(html);
-    return new ScrapExResult({ body: html, status: 200, headers: {}, url: fakeUrl }, tree, fakeUrl);
-  }
-
-  // ── Pipeline factory ──────────────────────────────────────
-  pipeline(data) { return new Pipeline(data); }
-
-  // ── Stats ─────────────────────────────────────────────────
-  get stats() { return this.engine.stats; }
-
-  // ── Quick factories ───────────────────────────────────────
-  static create(opts = {})    { return new ScrapEx(opts); }
-  static async fetch(url, opts) { return ScrapEx.create(opts).fetch(url); }
-}
-
-// ── Standalone Utility Functions ────────────────────────────
-export { buildTree, FastTokenizer, QueryEngine }   from './core/parser.js';
-export { HttpEngine, SmartCache, RateLimiter }     from './core/engine.js';
-export { pipeline, Pipeline }                       from './pipeline/index.js';
-export {
-  extractLinks, extractTables, extractMedia,
-  extractSchema, extractMainContent,
-  extractContacts, detectPagination, clean,
-}                                                  from './extractors/index.js';
-
-export default ScrapEx;
-
-// ── Helpers ──────────────────────────────────────────────────
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+export const pipeline = data => new Pipeline(data);
