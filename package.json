@@ -1,0 +1,17 @@
+{
+  "name": "scrapex",
+  "version": "2.0.0",
+  "description": "⚡ Professional Web Scraping Library — Fast, Smart, Zero Dependencies",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./parser": "./core/parser.js",
+    "./engine": "./core/engine.js",
+    "./extractors": "./extractors/index.js",
+    "./pipeline": "./pipeline/index.js"
+  },
+  "keywords": ["scraping", "html", "parser", "crawler", "extract"],
+  "license": "MIT",
+  "engines": { "node": ">=18.0.0" }
+}
